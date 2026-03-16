@@ -8,6 +8,7 @@ import signal
 
 from config import TOKEN, PREFIX, MIN_ACCOUNT_AGE_DAYS
 from database import Database
+from api_server import start_api
 
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix=PREFIX, intents=intents)
@@ -24,6 +25,10 @@ async def on_ready():
     print(f'Bot is in {len(bot.guilds)} guilds')
     bot.loop.create_task(voice_monitor())
     await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help | {len(bot.guilds)} servers"))
+    
+    # Start API server
+    start_api(bot)
+    print(f'API server started on port {os.getenv("PORT", 5000)}')
 
 async def voice_monitor():
     await bot.wait_until_ready()
@@ -42,20 +47,19 @@ async def voice_monitor():
                                     coins_to_add = 1.0  # Base rate
                                     
                                     # Check if sharing screen
-                                    for member_vc in guild.voice_channels:
-                                        if member in member_vc.members:
-                                            if member.voice and member.voice.self_stream:
-                                                coins_to_add = 1.5
-                                                break
+                                    if member.voice and member.voice.self_stream:
+                                        coins_to_add = 1.5
                                     
                                     db.add_coins(member.id, coins_to_add)
                                 else:
                                     # Blacklist new accounts
-                                    if not db.get_user_coins(member.id).get('blacklisted', False):
-                                        user_data = db.get_user_coins(member.id)
-                                        user_data['blacklisted'] = True
-                                        db.update_user_coins(member.id, user_data['coins'], 
-                                                           blacklisted=True)
+                                    user_data = db.get_user_coins(member.id)
+                                    if not user_data.get('blacklisted', False):
+                                        db.update_user_coins(
+                                            member.id, 
+                                            user_data['coins'], 
+                                            blacklisted=True
+                                        )
                                         
                                         try:
                                             await member.send("❌ Your account is too new. You have been blacklisted from earning coins.")
@@ -78,9 +82,13 @@ async def check_coins(ctx):
         await ctx.send(embed=embed)
         return
     
+    # Get key count
+    with open('keys/unused_keys.txt', 'r') as f:
+        keys_available = len(f.read().splitlines())
+    
     embed = discord.Embed(
         title="💰 Coin System",
-        description=f"**Your Balance:** {user_data['coins']:.2f} coins",
+        description=f"**Your Balance:** {user_data['coins']:.2f} coins\n\n**Keys Available:** {keys_available}",
         color=0x00FF00
     )
     
@@ -91,15 +99,9 @@ async def check_coins(ctx):
         "• 1 coin per minute in VC\n"
         "• 1.5 coins per minute with screenshare\n"
         "• No coins if AFK/deafened\n"
-        f"• Redeem keys for {KEY_COST} coins (max {DAILY_KEY_LIMIT}/day)"
+        f"• Redeem keys for {90} coins (max {2}/day)"
     )
     embed.add_field(name="📜 Server Rules", value=rules, inline=False)
-    
-    # Key stock
-    with open('keys/unused_keys.txt', 'r') as f:
-        keys_available = len(f.read().splitlines())
-    
-    embed.add_field(name="🔑 Keys Available", value=str(keys_available), inline=True)
     
     embed.set_footer(text="Programmed by SUBHAN")
     
@@ -124,27 +126,27 @@ async def check_coins(ctx):
                 await interaction.response.send_message("❌ You are blacklisted!", ephemeral=True)
                 return
             
-            if user_data['daily_keys'] >= DAILY_KEY_LIMIT:
+            if user_data['daily_keys'] >= 2:
                 await interaction.response.send_message(
-                    f"❌ Daily key limit reached ({DAILY_KEY_LIMIT}/day)", 
+                    f"❌ Daily key limit reached (2/day)", 
                     ephemeral=True
                 )
                 return
             
-            if user_data['coins'] < KEY_COST:
+            if user_data['coins'] < 90:
                 await interaction.response.send_message(
-                    f"❌ Insufficient coins! Need {KEY_COST} coins", 
+                    f"❌ Insufficient coins! Need 90 coins", 
                     ephemeral=True
                 )
                 return
             
             key = bot.db.get_key()
             if key:
-                bot.db.remove_coins(interaction.user.id, KEY_COST)
+                bot.db.remove_coins(interaction.user.id, 90)
                 user_data['daily_keys'] += 1
                 bot.db.update_user_coins(
                     interaction.user.id, 
-                    user_data['coins'] - KEY_COST,
+                    user_data['coins'] - 90,
                     daily_keys=user_data['daily_keys']
                 )
                 
@@ -162,23 +164,32 @@ async def check_coins(ctx):
     
     await ctx.send(embed=embed, view=CoinView())
 
-@bot.command(name='redeem')
+# Admin commands
+@bot.command(name='addkey')
+@commands.has_permissions(administrator=True)
+async def add_key(ctx, *, key):
+    """Add a key (Admin only)"""
+    bot.db.add_key(key)
+    await ctx.send(f"✅ Key added successfully!")
+
+@bot.command(name='addkeys')
 @commands.has_permissions(administrator=True)
 async def add_keys(ctx, *, keys):
-    """Add keys (Admin only)"""
+    """Add multiple keys (Admin only)"""
     key_list = keys.split('\n')
+    count = 0
     for key in key_list:
         if key.strip():
             bot.db.add_key(key.strip())
+            count += 1
     
-    await ctx.send(f"✅ Added {len(key_list)} keys!")
+    await ctx.send(f"✅ Added {count} keys!")
 
 @bot.command(name='blacklist')
 @commands.has_permissions(administrator=True)
 async def blacklist_user(ctx, user: discord.User):
     """Blacklist a user (Admin only)"""
     user_data = bot.db.get_user_coins(user.id)
-    user_data['blacklisted'] = True
     bot.db.update_user_coins(user.id, user_data['coins'], blacklisted=True)
     
     try:
@@ -193,7 +204,6 @@ async def blacklist_user(ctx, user: discord.User):
 async def unblacklist_user(ctx, user: discord.User):
     """Unblacklist a user (Admin only)"""
     user_data = bot.db.get_user_coins(user.id)
-    user_data['blacklisted'] = False
     bot.db.update_user_coins(user.id, user_data['coins'], blacklisted=False)
     
     try:
@@ -223,24 +233,6 @@ async def remove_earning_vc(ctx, vc: discord.VoiceChannel):
     else:
         await ctx.send(f"❌ {vc.name} is not an earning channel")
 
-@bot.command(name='listvc')
-@commands.has_permissions(administrator=True)
-async def list_earning_vc(ctx):
-    """List earning channels (Admin only)"""
-    if bot.vc_channels:
-        channels = []
-        for vc_id in bot.vc_channels:
-            vc = bot.get_channel(vc_id)
-            if vc:
-                channels.append(f"• {vc.name}")
-        
-        if channels:
-            await ctx.send("**Earning Channels:**\n" + "\n".join(channels))
-        else:
-            await ctx.send("No earning channels set (all channels earn)")
-    else:
-        await ctx.send("All voice channels are earning channels")
-
 @bot.command(name='resetdaily')
 @commands.has_permissions(administrator=True)
 async def reset_daily_keys(ctx):
@@ -248,12 +240,5 @@ async def reset_daily_keys(ctx):
     bot.db.reset_daily_keys()
     await ctx.send("✅ Daily key limits reset!")
 
-# Load cogs
-async def load_extensions():
-    for filename in os.listdir('./cogs'):
-        if filename.endswith('.py'):
-            await bot.load_extension(f'cogs.{filename[:-3]}')
-
 if __name__ == '__main__':
-    asyncio.run(load_extensions())
     bot.run(TOKEN)
